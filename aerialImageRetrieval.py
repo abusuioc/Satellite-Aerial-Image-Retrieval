@@ -1,165 +1,103 @@
-"""
-__author__ = Linlin Chen
-__email__ = lchen96@hawk.iit.edu
-
-
-@Description:
-This module is used to retrieve satellite/aerial image.
-Given a bounding box, which is composed of left up corner coordinate (latitude, longitude) 
-and right down corner coordinate (latitude, longitude).
-Return an aerial imagery (with maximum resolution available) downloaded from Bing map tile system.
-
-"""
-
-
-import sys, io, os
+import os
 from urllib import request
+from geopy.distance import geodesic
+import PIL
 from PIL import Image
 import time
 from datetime import timedelta
 
 from tilesystem import TileSystem
 
-
-BASEURL = "http://h0.ortho.tiles.virtualearth.net/tiles/h{0}.jpeg?g=131"
-IMAGEMAXSIZE = 8192 * 8192 * 8 # max width/height in pixels for the retrived image
-TILESIZE = 256              # in Bing tile system, one tile image is in size 256 * 256 pixels
+TILE_SIZE = 256
+OUTPUT_DIR = "./output/"
 
 
 class AerialImageRetrieval(object):
-    """The class for aerial image retrieval
+    PIL.Image.MAX_IMAGE_PIXELS = None
 
-    To create an AerialImageRetrieval object, simply give upper left latitude, longitude,
-    and lower right latitude and longitude
-    """
-    def __init__(self, lat1, lon1, lat2, lon2):
-        self.lat1 = lat1
-        self.lon1 = lon1
-        self.lat2 = lat2
-        self.lon2 = lon2
+    def __init__(self, upper_left, lower_right, zoom_level, name, tiles_url):
+        self.lat1 = upper_left[0]
+        self.lon1 = upper_left[1]
+        self.lat2 = lower_right[0]
+        self.lon2 = lower_right[1]
+        self.zoom = zoom_level
+        self.name = name
+        self.tiles_url = tiles_url
 
-        self.tgtfolder = './output/'
         try:
-            os.makedirs(self.tgtfolder)
+            os.makedirs(OUTPUT_DIR)
         except FileExistsError:
             pass
         except OSError:
             raise
-        
 
     def download_image(self, quadkey):
-        """This method is used to download a tile image given the quadkey from Bing tile system
-        
-        Arguments:
-            quadkey {[string]} -- [The quadkey for a tile image]
-        
-        Returns:
-            [Image] -- [A PIL Image]
-        """
-
-        with request.urlopen(BASEURL.format(quadkey)) as file:
+        with request.urlopen(self.tiles_url.format(quadkey)) as file:
             return Image.open(file)
 
-
-
     def is_valid_image(self, image):
-        """Check whether the downloaded image is valid, 
-        by comparing the downloaded image with a NULL image returned by any unsuccessfully retrieval
-
-        Bing tile system will return the same NULL image if the query quadkey is not existed in the Bing map database.
-        
-        Arguments:
-            image {[Image]} -- [a Image type image to be valided]
-        
-        Returns:
-            [boolean] -- [whether the image is valid]
-        """
-
         if not os.path.exists('null.png'):
-            nullimg = self.download_image('11111111111111111111')      # an invalid quadkey which will download a null jpeg from Bing tile system
-            nullimg.save('./null.png')
+            null_image = self.download_image(
+                '11111111111111111111')  # an invalid quadkey which will download a null jpeg from Bing tile system
+            null_image.save('./null.png')
         return not (image == Image.open('./null.png'))
 
+    def retrieve(self):
+        pixelX1, pixelY1 = TileSystem.latlong_to_pixelXY(self.lat1, self.lon1, self.zoom)
+        pixelX2, pixelY2 = TileSystem.latlong_to_pixelXY(self.lat2, self.lon2, self.zoom)
 
+        pixelX1, pixelX2 = min(pixelX1, pixelX2), max(pixelX1, pixelX2)
+        pixelY1, pixelY2 = min(pixelY1, pixelY2), max(pixelY1, pixelY2)
 
-    def max_resolution_imagery_retrieval(self):
-        """The main aerial retrieval method
+        # Bounding box's two coordinates coincide at the same pixel, which is invalid for an aerial image.
+        # Raise error and directly return without retrieving any valid image.
+        if abs(pixelX1 - pixelX2) <= 1 or abs(pixelY1 - pixelY2) <= 1:
+            print("Cannot find a valid aerial imagery for the given bounding box!")
+            return
 
-        It will firstly determine the appropriate level used to retrieve the image.
-        The appropriate level should satisfy:
-            1. All the tile image within the given bounding box at that level should all exist
-            2. The retrieved image cannot exceed the maximum supported image size, which is 8192*8192 (Otherwise the image size will be too large if the bounding box is very large)
-        
-        Then for the given level, we can download each aerial tile image, and stitch them together.
+        tileX1, tileY1 = TileSystem.pixelXY_to_tileXY(pixelX1, pixelY1)
+        tileX2, tileY2 = TileSystem.pixelXY_to_tileXY(pixelX2, pixelY2)
 
-        Lastly, we have to crop the image based on the given bounding box
+        # Stitch the tile images together
+        result = Image.new('RGB', ((tileX2 - tileX1 + 1) * TILE_SIZE, (tileY2 - tileY1 + 1) * TILE_SIZE))
 
-        Returns:
-            [boolean] -- [indicate whether the aerial image retrieval is successful]
-        """
+        # initialize a initial timestamp for remaining time estimation
+        old_ts = time.time()
+        avg_download_time = None
+        retrieve_success = False
+        for tileY in range(tileY1, tileY2 + 1):
+            retrieve_success, horizontal_image = self.horizontal_retrieval_and_stitch_image(tileX1, tileX2, tileY,
+                                                                                            self.zoom)
+            if not retrieve_success:
+                break
+            result.paste(horizontal_image, (0, (tileY - tileY1) * TILE_SIZE))
+            ts = time.time()
+            timespan = ts - old_ts
+            local_prevision = timespan * (tileY2 - tileY)
+            # if it's not the first cycle
+            if avg_download_time:
+                # make and average between past averages and a prediction made on last download time
+                historical_prevision = avg_download_time - timespan
+                avg_download_time = (local_prevision + historical_prevision) / 2
+            else:
+                # if it's the first cycle just use a prediction made on last download time
+                avg_download_time = local_prevision
+            # remove microseconds from print
+            string_remaining_time = str(timedelta(seconds=avg_download_time)).split(".", 1)[0]
+            print("Remaining time " + string_remaining_time)
+            old_ts = ts
 
-        for levl in range(TileSystem.MAXLEVEL, 0, -1):
-            pixelX1, pixelY1 = TileSystem.latlong_to_pixelXY(self.lat1, self.lon1, levl)
-            pixelX2, pixelY2 = TileSystem.latlong_to_pixelXY(self.lat2, self.lon2, levl)
+        if not retrieve_success:
+            return
 
-            pixelX1, pixelX2 = min(pixelX1, pixelX2), max(pixelX1, pixelX2)
-            pixelY1, pixelY2 = min(pixelY1, pixelY2), max(pixelY1, pixelY2)
-
-            
-            #Bounding box's two coordinates coincide at the same pixel, which is invalid for an aerial image.
-            #Raise error and directly return without retriving any valid image.
-            if abs(pixelX1 - pixelX2) <= 1 or abs(pixelY1 - pixelY2) <= 1:
-                print("Cannot find a valid aerial imagery for the given bounding box!")
-                return
-
-            if abs(pixelX1 - pixelX2) * abs(pixelY1 - pixelY2) > IMAGEMAXSIZE:
-                print("Current level {} results an image exceeding the maximum image size {}, will SKIP".format(levl,IMAGEMAXSIZE))
-                continue
-            
-            tileX1, tileY1 = TileSystem.pixelXY_to_tileXY(pixelX1, pixelY1)
-            tileX2, tileY2 = TileSystem.pixelXY_to_tileXY(pixelX2, pixelY2)
-
-            # Stitch the tile images together
-            result = Image.new('RGB', ((tileX2 - tileX1 + 1) * TILESIZE, (tileY2 - tileY1 + 1) * TILESIZE))
-            retrieve_sucess = False
-            # initialize a initial timestap for remaining time estimation
-            old_ts = time.time()
-            avg_download_time = None
-            for tileY in range(tileY1, tileY2 + 1):
-                retrieve_sucess, horizontal_image = self.horizontal_retrieval_and_stitch_image(tileX1, tileX2, tileY, levl)
-                if not retrieve_sucess:
-                    break
-                result.paste(horizontal_image, (0, (tileY - tileY1) * TILESIZE))
-                ts = time.time()
-                timespan = ts-old_ts
-                local_prevision = timespan * (tileY2-tileY)
-                # if it's not the first cycle
-                if (avg_download_time):
-                    # make and average between past averages and a prediction made on last download time
-                    historical_prevision = avg_download_time-timespan
-                    avg_download_time = (local_prevision+historical_prevision)/2
-                else:
-                    # if it's the first cycle just use a prediction made on last download time
-                    avg_download_time = local_prevision
-                # remove microseconds from print
-                string_remaining_time = str(timedelta(seconds=avg_download_time)).split(".",1)[0]
-                print("Remaining time "+string_remaining_time)
-                old_ts = ts
-
-            if not retrieve_sucess:
-                continue
-
-            # Crop the image based on the given bounding box
-            leftup_cornerX, leftup_cornerY = TileSystem.tileXY_to_pixelXY(tileX1, tileY1)
-            retrieve_image = result.crop((pixelX1 - leftup_cornerX, pixelY1 - leftup_cornerY, \
-                                        pixelX2 - leftup_cornerX, pixelY2 - leftup_cornerY))
-            print("Finish the aerial image retrieval, store the image aerialImage_{0}.jpeg in folder {1}".format(levl, self.tgtfolder))
-            filename = os.path.join(self.tgtfolder, 'aerialImage_{}.jpeg'.format(levl))
-            retrieve_image.save(filename)
-            return True
-        return False    
-            
-
+        # Crop the image based on the given bounding box
+        leftup_cornerX, leftup_cornerY = TileSystem.tileXY_to_pixelXY(tileX1, tileY1)
+        retrieve_image = result.crop(
+            (pixelX1 - leftup_cornerX, pixelY1 - leftup_cornerY, pixelX2 - leftup_cornerX, pixelY2 - leftup_cornerY))
+        filename = "{0}_{1}.jpeg".format(self.name, self.zoom)
+        file = os.path.join(OUTPUT_DIR, filename)
+        retrieve_image.save(file)
+        print("Arial stored in file {0}".format(filename))
 
     def horizontal_retrieval_and_stitch_image(self, tileX_start, tileX_end, tileY, level):
         """Horizontally retrieve tile images and then stitch them together,
@@ -182,43 +120,84 @@ class AerialImageRetrieval(object):
             if self.is_valid_image(image):
                 imagelist.append(image)
             else:
-                #print(quadkey)
+                # print(quadkey)
                 print("Cannot find tile image at level {0} for tile coordinate ({1}, {2})".format(level, tileX, tileY))
                 return False, None
-        result = Image.new('RGB', (len(imagelist) * TILESIZE, TILESIZE))
+        result = Image.new('RGB', (len(imagelist) * TILE_SIZE, TILE_SIZE))
         for i, image in enumerate(imagelist):
-            result.paste(image, (i * TILESIZE, 0))
+            result.paste(image, (i * TILE_SIZE, 0))
         return True, result
-        
+
+
+def calculate_coordinates_bounds_from_center(center, distance_vertical_meters, distance_horizontal_meters):
+    upper_left = geodesic(meters=distance_horizontal_meters).destination(
+        geodesic(meters=distance_vertical_meters).destination(center, 0), -90)
+    lower_right = geodesic(meters=distance_horizontal_meters).destination(
+        geodesic(meters=distance_vertical_meters).destination(center, 180), 90)
+    return (upper_left.latitude, upper_left.longitude), (lower_right.latitude, lower_right.longitude)
+
+
+def calculate_larger_coordinates_rectangle_with_aspectratio_1p414(upper_left, lower_right):
+    center = ((upper_left[0] + lower_right[0]) / 2, (upper_left[1] + lower_right[1]) / 2)
+
+    # measure the rectangle's area by using the distances in the middle
+    half_width = geodesic((center[0], upper_left[1]), (center[0], center[1])).meters
+    half_height = geodesic((upper_left[0], center[1]), (center[0], center[1])).meters
+
+    if half_height > half_width:
+        # portrait
+        height_per_width = half_height / half_width
+        if height_per_width < 1.414:
+            target_half_height = half_width * 1.414
+            return calculate_coordinates_bounds_from_center(center, target_half_height, half_width)
+        else:
+            target_half_width = half_height * 1.414
+            return calculate_coordinates_bounds_from_center(center, half_height, target_half_width)
+    else:
+        # landscape
+        width_per_height = half_width / half_height
+        if width_per_height < 1.414:
+            target_half_width = half_height * 1.414
+            return calculate_coordinates_bounds_from_center(center, half_height, target_half_width)
+        else:
+            target_half_height = half_width / 1.414
+            return calculate_coordinates_bounds_from_center(center, target_half_height, half_width)
+
+
+def calculate_area_in_square_km(upper_left, lower_right):
+    center = ((upper_left[0] + lower_right[0]) / 2, (upper_left[1] + lower_right[1]) / 2)
+
+    # measure the rectangle's area by using the distances in the middle
+    width = geodesic((center[0], upper_left[1]), (center[0], center[1])).kilometers * 2
+    height = geodesic((upper_left[0], center[1]), (center[0], center[1])).kilometers * 2
+    return width * height
+
+
+def retrieve_aerial_for(name, upper_left, lower_right, zoom, is_Aformat, bing_tiles_url):
+    print("Retrieving {0} ...".format(name))
+    print("Original bounds: ", (upper_left, lower_right))
+
+    larger_rectangle = (upper_left, lower_right)
+    if is_Aformat:
+        larger_rectangle = calculate_larger_coordinates_rectangle_with_aspectratio_1p414(upper_left, lower_right)
+        print("Ax bigger bounds: ", larger_rectangle)
+
+    print("Total square kilometers: ", calculate_area_in_square_km(larger_rectangle[0], larger_rectangle[1]).__ceil__())
+
+    AerialImageRetrieval(larger_rectangle[0], larger_rectangle[1], zoom,
+                         name, bing_tiles_url).retrieve()
 
 
 def main():
-    """The main entrance.
-    Decode the upper left and lower right coordinates, and retrieve the aerial image withing that bounding box  
-    """
-
-    # decode the bounding box coordinates
-    try:
-        args = sys.argv[1:]
-    except IndexError:
-        sys.exit('Diagonal (Latitude, Longitude) coordinates of the bounding box must be input')
-    if len(args) != 4:
-        sys.exit('Please input Latitude, Longitude coordinates for both upper-left and lower-right corners!')
-    
-    try:
-        lat1, lon1, lat2, lon2 = float(args[0]), float(args[1]), float(args[2]), float(args[3])
-    except ValueError:
-        sys.exit('Latitude and longitude must be float type')
-    
-
-    # Retrieve the aerial image
-    imgretrieval = AerialImageRetrieval(lat1, lon1, lat2, lon2)
-    if imgretrieval.max_resolution_imagery_retrieval():
-        print("Successfully retrieve the image with maximum resolution!")
-    else:
-        print("Cannot retrieve the desired image! (Possible reason: expected tile image does not exist.)")
+    PIL.Image.MAX_IMAGE_PIXELS = None
+    retrieve_aerial_for("Burano",
+                        (45.487969, 12.412582),
+                        (45.482488, 12.421843),
+                        20,
+                        False,
+                        "http://ecn.t3.tiles.virtualearth.net/tiles/a{0}.jpeg?g=14055"
+                        )
 
 
 if __name__ == '__main__':
     main()
-
